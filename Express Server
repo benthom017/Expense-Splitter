@@ -1,0 +1,133 @@
+// Expense Splitter + Tracker — Express Server (Replit)
+// Stack: Express, Google Cloud Vision, ChatGPT (via REST), Multer
+// Environment (set in Replit Secrets):
+//   OPENAI_API_KEY
+//   GOOGLE_APPLICATION_CREDENTIALS_JSON  (paste full service account JSON)
+//
+// Endpoints:
+//   POST /api/ocr   (multipart/form-data: file) -> { text }
+//   POST /api/parse (json: { rawText })        -> { items, subtotal, tax, tip }
+//
+// Notes:
+// - This implementation supports image files (JPG/PNG). For PDFs, Vision requires
+//   async batch processing via GCS, which is intentionally omitted for a weekend build.
+
+const express = require("express");
+const cors = require("cors");
+const multer = require("multer");
+const { ImageAnnotatorClient } = require("@google-cloud/vision");
+
+const app = express();
+app.use(cors());
+app.use(express.json({ limit: "2mb" }));
+
+// ---- Google Vision Client from env JSON ----
+function buildVisionClientFromEnv() {
+  const raw = process.env.GOOGLE_APPLICATION_CREDENTIALS_JSON;
+  if (!raw) throw new Error("Missing GOOGLE_APPLICATION_CREDENTIALS_JSON env");
+  let creds;
+  try { creds = JSON.parse(raw); } catch (e) {
+    throw new Error("GOOGLE_APPLICATION_CREDENTIALS_JSON is not valid JSON");
+  }
+  return new ImageAnnotatorClient({ credentials: creds });
+}
+
+const vision = buildVisionClientFromEnv();
+
+// ---- Upload handling (in-memory) ----
+const upload = multer({
+  storage: multer.memoryStorage(),
+  limits: { fileSize: 6 * 1024 * 1024 }, // 6MB
+});
+
+// ---- OCR route ----
+app.post("/api/ocr", upload.single("file"), async (req, res) => {
+  try {
+    if (!req.file) return res.status(400).json({ error: "NO_FILE" });
+    const mime = req.file.mimetype || "";
+    if (!mime.startsWith("image/")) {
+      return res.status(400).json({ error: "UNSUPPORTED_TYPE", detail: "Only image/* files are supported in this build." });
+    }
+    const [result] = await vision.textDetection({ image: { content: req.file.buffer } });
+    const text = result.fullTextAnnotation?.text || (result.textAnnotations?.[0]?.description ?? "");
+    return res.json({ text });
+  } catch (e) {
+    console.error("/api/ocr error", e);
+    return res.status(500).json({ error: "OCR_FAILED", detail: String(e) });
+  }
+});
+
+// ---- Parse with ChatGPT (strict JSON) ----
+const SYSTEM_PROMPT = `You are a strict extraction engine. From raw receipt text, output ONLY valid JSON:
+{"items":[{"item":"string","qty":number,"price":number}],"subtotal":number|null,"tax":number|null,"tip":number|null}
+Rules:
+- Ignore store header/footer unless it contains line items.
+- Prefer line items with right-aligned prices.
+- qty defaults to 1 if unclear.
+- price is per-item if present; otherwise use line total and qty=1.
+- Do not include subtotal/tax/tip as items. Never include currency symbols.
+- If uncertain, make best effort but keep JSON valid.`;
+
+async function chatJSON(rawText) {
+  const resp = await fetch("https://api.openai.com/v1/chat/completions", {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/json",
+      Authorization: `Bearer ${process.env.OPENAI_API_KEY}`,
+    },
+    body: JSON.stringify({
+      model: "gpt-4o-mini",
+      messages: [
+        { role: "system", content: SYSTEM_PROMPT },
+        { role: "user", content: String(rawText).slice(0, 15000) },
+      ],
+      response_format: { type: "json_object" },
+      temperature: 0.1,
+    }),
+  });
+  if (!resp.ok) {
+    const text = await resp.text();
+    throw new Error(`OpenAI error ${resp.status}: ${text}`);
+  }
+  const data = await resp.json();
+  const content = data?.choices?.[0]?.message?.content || "{}";
+  return JSON.parse(content);
+}
+
+app.post("/api/parse", async (req, res) => {
+  try {
+    const rawText = (req.body?.rawText || "").trim();
+    if (!rawText) return res.status(400).json({ error: "NO_TEXT" });
+    if (!process.env.OPENAI_API_KEY) return res.status(500).json({ error: "NO_OPENAI_KEY" });
+
+    const parsed = await chatJSON(rawText);
+
+    // Basic shape guard
+    const items = Array.isArray(parsed.items) ? parsed.items : [];
+    const cleanItems = items
+      .map((x) => ({
+        item: String(x.item || "").slice(0, 200),
+        qty: Number.isFinite(Number(x.qty)) ? Number(x.qty) : 1,
+        price: Number.isFinite(Number(x.price)) ? Number(x.price) : 0,
+      }))
+      .filter((x) => x.item);
+
+    const out = {
+      items: cleanItems,
+      subtotal: Number.isFinite(Number(parsed.subtotal)) ? Number(parsed.subtotal) : null,
+      tax: Number.isFinite(Number(parsed.tax)) ? Number(parsed.tax) : null,
+      tip: Number.isFinite(Number(parsed.tip)) ? Number(parsed.tip) : null,
+    };
+
+    return res.json(out);
+  } catch (e) {
+    console.error("/api/parse error", e);
+    return res.status(500).json({ error: "PARSE_FAILED", detail: String(e) });
+  }
+});
+
+// Health check
+app.get("/api/health", (_req, res) => res.json({ ok: true }));
+
+const PORT = process.env.PORT || 3000;
+app.listen(PORT, () => console.log(`API on :${PORT}`));
